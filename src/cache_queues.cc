@@ -56,6 +56,7 @@ bool do_collision_for_return(Iter begin, Iter end, PACKET& packet, unsigned sham
 {
   return do_collision_for(begin, end, packet, shamt, [](PACKET& source, PACKET& destination) {
     source.data = destination.data;
+    source.pf_metadata = destination.pf_metadata;
     for (auto ret : source.to_return)
       ret->return_data(source);
   });
@@ -63,8 +64,8 @@ bool do_collision_for_return(Iter begin, Iter end, PACKET& packet, unsigned sham
 
 void CACHE::NonTranslatingQueues::check_collision()
 {
-  std::size_t write_shamt = match_offset_bits ? 0 : OFFSET_BITS;
-  std::size_t read_shamt = OFFSET_BITS;
+  auto write_shamt = match_offset_bits ? 0 : OFFSET_BITS;
+  auto read_shamt = OFFSET_BITS;
 
   // Check WQ for duplicates, merging if they are found
   for (auto wq_it = std::find_if(std::begin(WQ), std::end(WQ), std::not_fn(&PACKET::forward_checked)); wq_it != std::end(WQ);) {
@@ -171,7 +172,6 @@ bool CACHE::NonTranslatingQueues::do_add_queue(R& queue, std::size_t queue_size,
   auto fwd_pkt = packet;
   fwd_pkt.forward_checked = false;
   fwd_pkt.translate_issued = false;
-  //fwd_pkt.prefetch_from_this = false;
   fwd_pkt.event_cycle = current_cycle + (warmup ? 0 : HIT_LATENCY);
   queue.insert(ins_loc, fwd_pkt);
 
@@ -287,7 +287,7 @@ void CACHE::TranslatingQueues::return_data(const PACKET& packet)
   // Find all packets that match the page of the returned packet
   for (auto& wq_entry : WQ) {
     if ((wq_entry.v_address >> LOG2_PAGE_SIZE) == (packet.v_address >> LOG2_PAGE_SIZE)) {
-      wq_entry.address = splice_bits(packet.data, wq_entry.v_address, LOG2_PAGE_SIZE); // translated address
+      wq_entry.address = champsim::splice_bits(packet.data, wq_entry.v_address, LOG2_PAGE_SIZE); // translated address
       wq_entry.event_cycle = std::min(wq_entry.event_cycle, current_cycle + (warmup ? 0 : HIT_LATENCY));
       wq_entry.is_translated = true; // This entry is now translated
     }
@@ -295,7 +295,7 @@ void CACHE::TranslatingQueues::return_data(const PACKET& packet)
 
   for (auto& rq_entry : RQ) {
     if ((rq_entry.v_address >> LOG2_PAGE_SIZE) == (packet.v_address >> LOG2_PAGE_SIZE)) {
-      rq_entry.address = splice_bits(packet.data, rq_entry.v_address, LOG2_PAGE_SIZE); // translated address
+      rq_entry.address = champsim::splice_bits(packet.data, rq_entry.v_address, LOG2_PAGE_SIZE); // translated address
       rq_entry.event_cycle = std::min(rq_entry.event_cycle, current_cycle + (warmup ? 0 : HIT_LATENCY));
       rq_entry.is_translated = true; // This entry is now translated
     }
@@ -303,7 +303,7 @@ void CACHE::TranslatingQueues::return_data(const PACKET& packet)
 
   for (auto& pq_entry : PQ) {
     if ((pq_entry.v_address >> LOG2_PAGE_SIZE) == (packet.v_address >> LOG2_PAGE_SIZE)) {
-      pq_entry.address = splice_bits(packet.data, pq_entry.v_address, LOG2_PAGE_SIZE); // translated address
+      pq_entry.address = champsim::splice_bits(packet.data, pq_entry.v_address, LOG2_PAGE_SIZE); // translated address
       pq_entry.event_cycle = std::min(pq_entry.event_cycle, current_cycle + (warmup ? 0 : HIT_LATENCY));
       pq_entry.is_translated = true; // This entry is now translated
     }
