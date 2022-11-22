@@ -64,10 +64,11 @@ void champsim::plain_printer::print(CACHE::stats_type stats)
     stream << "REQUESTED: " << std::setw(10) << stats.pf_requested << "  ";
     stream << "ISSUED: " << std::setw(10) << stats.pf_issued << "  ";
     stream << "USEFUL: " << std::setw(10) << stats.pf_useful << "  ";
+    stream << "LATE: " << std::setw(10) << stats.pf_late << "  ";
     stream << "USELESS: " << std::setw(10) << stats.pf_useless << std::endl;
 
     stream << stats.name << " AVERAGE MISS LATENCY: " << (1.0 * (stats.total_miss_latency)) / TOTAL_MISS << " cycles" << std::endl;
-    // stream << " AVERAGE MISS LATENCY: " << (stats.total_miss_latency)/TOTAL_MISS << " cycles " << stats.total_miss_latency << "/" << TOTAL_MISS<< std::endl;
+    // stream << " AVERAGE MISS LATENCY: " << (1.0 * (stats.total_miss_latency))/TOTAL_MISS << " cycles " << stats.total_miss_latency << "/" << TOTAL_MISS<< std::endl;
   }
 }
 

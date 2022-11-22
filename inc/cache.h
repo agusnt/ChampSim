@@ -20,6 +20,7 @@ struct cache_stats {
   uint64_t pf_requested = 0;
   uint64_t pf_issued = 0;
   uint64_t pf_useful = 0;
+  uint64_t pf_late = 0;
   uint64_t pf_useless = 0;
   uint64_t pf_fill = 0;
 

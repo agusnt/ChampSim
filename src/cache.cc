@@ -172,28 +172,35 @@ bool CACHE::readlike_miss(const PACKET& handle_pkt)
                    std::back_inserter(mshr_entry->to_return));
 
     if (mshr_entry->type == PREFETCH && handle_pkt.type != PREFETCH) {
-      // Mark the prefetch as useful
+      // Mark the prefetch as late 
       if (mshr_entry->prefetch_from_this)
-        sim_stats.back().pf_useful++;
+        ++sim_stats.back().pf_late;
 
       uint64_t prior_event_cycle = mshr_entry->event_cycle;
+      uint64_t prior_enqueued_cycle = mshr_entry->cycle_enqueued;
       auto to_return = std::move(mshr_entry->to_return);
       *mshr_entry = handle_pkt;
 
       // in case request is already returned, we should keep event_cycle
       mshr_entry->event_cycle = prior_event_cycle;
+      mshr_entry->cycle_enqueued = prior_enqueued_cycle;
       mshr_entry->to_return = std::move(to_return);
     }
   } else {
-    if (mshr_full)  // not enough MSHR resource
+    //if (mshr_full)  // not enough MSHR resource
+    //  return false; // TODO should we allow prefetches anyway if they will not
+    //                // be filled to this level?
+    if (mshr_full && handle_pkt.fill_this_level)  // not enough MSHR resource
       return false; // TODO should we allow prefetches anyway if they will not
                     // be filled to this level?
+
 
     auto fwd_pkt = handle_pkt;
 
     if (fwd_pkt.type == WRITE)
       fwd_pkt.type = RFO;
 
+    fwd_pkt.prefetch_from_this = false;
     if (handle_pkt.fill_this_level)
       fwd_pkt.to_return = {this};
     else
@@ -439,7 +446,10 @@ void CACHE::return_data(const PACKET& packet)
   if constexpr (champsim::debug_print) {
     std::cout << "[" << NAME << "_MSHR] " << __func__ << " instr_id: " << mshr_entry->instr_id;
     std::cout << " address: " << std::hex << mshr_entry->address;
+    std::cout << " v_address: " << packet.v_address;
     std::cout << " data: " << mshr_entry->data << std::dec;
+    std::cout << " latency: " << (current_cycle - mshr_entry->cycle_enqueued);
+    std::cout << " enqueued: " << (mshr_entry->cycle_enqueued);
     std::cout << " event: " << mshr_entry->event_cycle << " current: " << current_cycle << std::endl;
   }
 
@@ -475,7 +485,6 @@ uint32_t CACHE::get_size(uint8_t queue_type, uint64_t)
   else if (queue_type == 4)
     return queues.PTWQ_SIZE;
 
-
   return 0;
 }
 
@@ -504,6 +513,7 @@ void CACHE::end_phase(unsigned cpu)
   roi_stats.back().pf_requested = sim_stats.back().pf_requested;
   roi_stats.back().pf_issued = sim_stats.back().pf_issued;
   roi_stats.back().pf_useful = sim_stats.back().pf_useful;
+  roi_stats.back().pf_late = sim_stats.back().pf_late;
   roi_stats.back().pf_useless = sim_stats.back().pf_useless;
   roi_stats.back().pf_fill = sim_stats.back().pf_fill;
 
