@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <cfenv>
 #include <cmath>
+#include <iostream>
 
 #include "champsim_constants.h"
 #include "deadlock.h"
@@ -34,11 +35,19 @@ uint64_t cycles(double time, int io_freq)
 }
 
 MEMORY_CONTROLLER::MEMORY_CONTROLLER(double freq_scale, int io_freq, double t_rp, double t_rcd, double t_cas, double turnaround,
-                                     std::vector<channel_type*>&& ul)
+                                     std::vector<channel_type*>&& ul, std::string mess_curve, double cpu_freq)
     : champsim::operable(freq_scale), queues(std::move(ul)), tRP(cycles(t_rp / 1000, io_freq)), tRCD(cycles(t_rcd / 1000, io_freq)),
       tCAS(cycles(t_cas / 1000, io_freq)), DRAM_DBUS_TURN_AROUND_TIME(cycles(turnaround / 1000, io_freq)),
       DRAM_DBUS_RETURN_TIME(cycles(std::ceil(BLOCK_SIZE) / std::ceil(DRAM_CHANNEL_WIDTH), 1))
 {
+  if (mess_curve.compare("") == 0) {
+    std::cout << "Using ChampSim DRAM Model" << std::endl;
+    isMessActive = false;
+  } else {
+    std::cout << "Using Mess DRAM Model: " << mess_curve << std::endl;
+    mess = MessMemCtrl(mess_curve, 10000, cpu_freq);
+    isMessActive = true;
+  }
 }
 
 long MEMORY_CONTROLLER::operate()
@@ -47,140 +56,162 @@ long MEMORY_CONTROLLER::operate()
 
   initiate_requests();
 
-  for (auto& channel : channels) {
-    if (warmup) {
-      for (auto& entry : channel.RQ) {
-        if (entry.has_value()) {
-          response_type response{entry->address, entry->v_address, entry->data, entry->pf_metadata, entry->instr_depend_on_me};
-          for (auto ret : entry.value().to_return)
-            ret->push_back(response);
+  if (!isMessActive) {
+    for (auto& channel : channels) {
+      if (warmup) {
+        for (auto& entry : channel.RQ) {
+          if (entry.has_value()) {
+            response_type response{entry->address, entry->v_address, entry->data, entry->pf_metadata, entry->instr_depend_on_me};
+            for (auto ret : entry.value().to_return)
+              ret->push_back(response);
 
-          ++progress;
+            ++progress;
+            entry.reset();
+          }
+        }
+
+        for (auto& entry : channel.WQ) {
+          if (entry.has_value()) {
+            ++progress;
+          }
           entry.reset();
         }
       }
 
-      for (auto& entry : channel.WQ) {
-        if (entry.has_value()) {
+      // Check for forwarding
+      channel.check_collision();
+
+      // Finish request
+      if (channel.active_request != std::end(channel.bank_request) && channel.active_request->event_cycle <= current_cycle) {
+        response_type response{channel.active_request->pkt->value().address, channel.active_request->pkt->value().v_address,
+                               channel.active_request->pkt->value().data, channel.active_request->pkt->value().pf_metadata,
+                               channel.active_request->pkt->value().instr_depend_on_me};
+        for (auto ret : channel.active_request->pkt->value().to_return)
+          ret->push_back(response);
+
+        channel.active_request->valid = false;
+
+        channel.active_request->pkt->reset();
+        channel.active_request = std::end(channel.bank_request);
+        ++progress;
+      }
+
+      // Check queue occupancy
+      auto wq_occu = static_cast<std::size_t>(std::count_if(std::begin(channel.WQ), std::end(channel.WQ), [](const auto& x) { return x.has_value(); }));
+      auto rq_occu = static_cast<std::size_t>(std::count_if(std::begin(channel.RQ), std::end(channel.RQ), [](const auto& x) { return x.has_value(); }));
+
+      // Change modes if the queues are unbalanced
+      if ((!channel.write_mode && (wq_occu >= DRAM_WRITE_HIGH_WM || (rq_occu == 0 && wq_occu > 0)))
+          || (channel.write_mode && (wq_occu == 0 || (rq_occu > 0 && wq_occu < DRAM_WRITE_LOW_WM)))) {
+        // Reset scheduled requests
+        for (auto it = std::begin(channel.bank_request); it != std::end(channel.bank_request); ++it) {
+          // Leave active request on the data bus
+          if (it != channel.active_request && it->valid) {
+            // Leave rows charged
+            if (it->event_cycle < (current_cycle + tCAS))
+              it->open_row = UINT32_MAX;
+
+            // This bank is ready for another DRAM request
+            it->valid = false;
+            it->pkt->value().scheduled = false;
+            it->pkt->value().event_cycle = current_cycle;
+          }
+        }
+
+        // Add data bus turn-around time
+        if (channel.active_request != std::end(channel.bank_request))
+          channel.dbus_cycle_available = channel.active_request->event_cycle + DRAM_DBUS_TURN_AROUND_TIME; // After ongoing finish
+        else
+          channel.dbus_cycle_available = current_cycle + DRAM_DBUS_TURN_AROUND_TIME;
+
+        // Invert the mode
+        channel.write_mode = !channel.write_mode;
+      }
+
+      // Look for requests to put on the bus
+      auto iter_next_process = std::min_element(std::begin(channel.bank_request), std::end(channel.bank_request), [](const auto& lhs, const auto& rhs) {
+        return !rhs.valid || (lhs.valid && lhs.event_cycle < rhs.event_cycle);
+      });
+      if (iter_next_process->valid && iter_next_process->event_cycle <= current_cycle) {
+        if (channel.active_request == std::end(channel.bank_request) && channel.dbus_cycle_available <= current_cycle) {
+          // Bus is available
+          // Put this request on the data bus
+          channel.active_request = iter_next_process;
+          channel.active_request->event_cycle = current_cycle + DRAM_DBUS_RETURN_TIME;
+
+          if (iter_next_process->row_buffer_hit)
+            if (channel.write_mode)
+              ++channel.sim_stats.WQ_ROW_BUFFER_HIT;
+            else
+              ++channel.sim_stats.RQ_ROW_BUFFER_HIT;
+          else if (channel.write_mode)
+            ++channel.sim_stats.WQ_ROW_BUFFER_MISS;
+          else
+            ++channel.sim_stats.RQ_ROW_BUFFER_MISS;
+
+          ++progress;
+        } else {
+          // Bus is congested
+          if (channel.active_request != std::end(channel.bank_request))
+            channel.sim_stats.dbus_cycle_congested += (channel.active_request->event_cycle - current_cycle);
+          else
+            channel.sim_stats.dbus_cycle_congested += (channel.dbus_cycle_available - current_cycle);
+          ++channel.sim_stats.dbus_count_congested;
+        }
+      }
+
+      // Look for queued packets that have not been scheduled
+      auto next_schedule = [](const auto& lhs, const auto& rhs) {
+        return !(rhs.has_value() && !rhs.value().scheduled)
+               || ((lhs.has_value() && !lhs.value().scheduled) && lhs.value().event_cycle < rhs.value().event_cycle);
+      };
+      DRAM_CHANNEL::queue_type::iterator iter_next_schedule;
+      if (channel.write_mode)
+        iter_next_schedule = std::min_element(std::begin(channel.WQ), std::end(channel.WQ), next_schedule);
+      else
+        iter_next_schedule = std::min_element(std::begin(channel.RQ), std::end(channel.RQ), next_schedule);
+
+      if (iter_next_schedule->has_value() && iter_next_schedule->value().event_cycle <= current_cycle) {
+        auto op_rank = dram_get_rank(iter_next_schedule->value().address);
+        auto op_bank = dram_get_bank(iter_next_schedule->value().address);
+        auto op_row = dram_get_row(iter_next_schedule->value().address);
+
+        auto op_idx = op_rank * DRAM_BANKS + op_bank;
+
+        if (!channel.bank_request[op_idx].valid) {
+          bool row_buffer_hit = (channel.bank_request[op_idx].open_row == op_row);
+
+          // this bank is now busy
+          channel.bank_request[op_idx] = {true, row_buffer_hit, op_row, current_cycle + tCAS + (row_buffer_hit ? 0 : tRP + tRCD), iter_next_schedule};
+
+          iter_next_schedule->value().scheduled = true;
+          iter_next_schedule->value().event_cycle = std::numeric_limits<uint64_t>::max();
+
           ++progress;
         }
-        entry.reset();
       }
     }
 
-    // Check for forwarding
-    channel.check_collision();
-
-    // Finish request
-    if (channel.active_request != std::end(channel.bank_request) && channel.active_request->event_cycle <= current_cycle) {
-      response_type response{channel.active_request->pkt->value().address, channel.active_request->pkt->value().v_address,
-                             channel.active_request->pkt->value().data, channel.active_request->pkt->value().pf_metadata,
-                             channel.active_request->pkt->value().instr_depend_on_me};
-      for (auto ret : channel.active_request->pkt->value().to_return)
-        ret->push_back(response);
-
-      channel.active_request->valid = false;
-
-      channel.active_request->pkt->reset();
-      channel.active_request = std::end(channel.bank_request);
-      ++progress;
-    }
-
-    // Check queue occupancy
-    auto wq_occu = static_cast<std::size_t>(std::count_if(std::begin(channel.WQ), std::end(channel.WQ), [](const auto& x) { return x.has_value(); }));
-    auto rq_occu = static_cast<std::size_t>(std::count_if(std::begin(channel.RQ), std::end(channel.RQ), [](const auto& x) { return x.has_value(); }));
-
-    // Change modes if the queues are unbalanced
-    if ((!channel.write_mode && (wq_occu >= DRAM_WRITE_HIGH_WM || (rq_occu == 0 && wq_occu > 0)))
-        || (channel.write_mode && (wq_occu == 0 || (rq_occu > 0 && wq_occu < DRAM_WRITE_LOW_WM)))) {
-      // Reset scheduled requests
-      for (auto it = std::begin(channel.bank_request); it != std::end(channel.bank_request); ++it) {
-        // Leave active request on the data bus
-        if (it != channel.active_request && it->valid) {
-          // Leave rows charged
-          if (it->event_cycle < (current_cycle + tCAS))
-            it->open_row = UINT32_MAX;
-
-          // This bank is ready for another DRAM request
-          it->valid = false;
-          it->pkt->value().scheduled = false;
-          it->pkt->value().event_cycle = current_cycle;
-        }
-      }
-
-      // Add data bus turn-around time
-      if (channel.active_request != std::end(channel.bank_request))
-        channel.dbus_cycle_available = channel.active_request->event_cycle + DRAM_DBUS_TURN_AROUND_TIME; // After ongoing finish
-      else
-        channel.dbus_cycle_available = current_cycle + DRAM_DBUS_TURN_AROUND_TIME;
-
-      // Invert the mode
-      channel.write_mode = !channel.write_mode;
-    }
-
-    // Look for requests to put on the bus
-    auto iter_next_process = std::min_element(std::begin(channel.bank_request), std::end(channel.bank_request),
-                                              [](const auto& lhs, const auto& rhs) { return !rhs.valid || (lhs.valid && lhs.event_cycle < rhs.event_cycle); });
-    if (iter_next_process->valid && iter_next_process->event_cycle <= current_cycle) {
-      if (channel.active_request == std::end(channel.bank_request) && channel.dbus_cycle_available <= current_cycle) {
-        // Bus is available
-        // Put this request on the data bus
-        channel.active_request = iter_next_process;
-        channel.active_request->event_cycle = current_cycle + DRAM_DBUS_RETURN_TIME;
-
-        if (iter_next_process->row_buffer_hit)
-          if (channel.write_mode)
-            ++channel.sim_stats.WQ_ROW_BUFFER_HIT;
-          else
-            ++channel.sim_stats.RQ_ROW_BUFFER_HIT;
-        else if (channel.write_mode)
-          ++channel.sim_stats.WQ_ROW_BUFFER_MISS;
-        else
-          ++channel.sim_stats.RQ_ROW_BUFFER_MISS;
-
-        ++progress;
-      } else {
-        // Bus is congested
-        if (channel.active_request != std::end(channel.bank_request))
-          channel.sim_stats.dbus_cycle_congested += (channel.active_request->event_cycle - current_cycle);
-        else
-          channel.sim_stats.dbus_cycle_congested += (channel.dbus_cycle_available - current_cycle);
-        ++channel.sim_stats.dbus_count_congested;
-      }
-    }
-
-    // Look for queued packets that have not been scheduled
-    auto next_schedule = [](const auto& lhs, const auto& rhs) {
-      return !(rhs.has_value() && !rhs.value().scheduled) || ((lhs.has_value() && !lhs.value().scheduled) && lhs.value().event_cycle < rhs.value().event_cycle);
-    };
-    DRAM_CHANNEL::queue_type::iterator iter_next_schedule;
-    if (channel.write_mode)
-      iter_next_schedule = std::min_element(std::begin(channel.WQ), std::end(channel.WQ), next_schedule);
-    else
-      iter_next_schedule = std::min_element(std::begin(channel.RQ), std::end(channel.RQ), next_schedule);
-
-    if (iter_next_schedule->has_value() && iter_next_schedule->value().event_cycle <= current_cycle) {
-      auto op_rank = dram_get_rank(iter_next_schedule->value().address);
-      auto op_bank = dram_get_bank(iter_next_schedule->value().address);
-      auto op_row = dram_get_row(iter_next_schedule->value().address);
-
-      auto op_idx = op_rank * DRAM_BANKS + op_bank;
-
-      if (!channel.bank_request[op_idx].valid) {
-        bool row_buffer_hit = (channel.bank_request[op_idx].open_row == op_row);
-
-        // this bank is now busy
-        channel.bank_request[op_idx] = {true, row_buffer_hit, op_row, current_cycle + tCAS + (row_buffer_hit ? 0 : tRP + tRCD), iter_next_schedule};
-
-        iter_next_schedule->value().scheduled = true;
-        iter_next_schedule->value().event_cycle = std::numeric_limits<uint64_t>::max();
-
-        ++progress;
-      }
-    }
+    return progress;
   }
 
-  return progress;
+  if (warmup)
+    return 1;
+
+  // Check if there is any request to return
+  auto lastReturnElement = MesstoReturn.lower_bound(MessEntry(current_cycle));
+
+  // Return the elements
+  std::for_each(std::begin(MesstoReturn), lastReturnElement, [](auto& e) {
+    // std::cout << current_cycle << " " << pkt.event_cycle << std::endl;
+    for (auto* ret : {&e.ul->returned}) {
+      ret->push_back(e.response);
+    }
+  });
+
+  // Remove elements from the list
+  MesstoReturn.erase(std::begin(MesstoReturn), lastReturnElement);
+  return 1;
 }
 
 void MEMORY_CONTROLLER::initialize()
@@ -212,6 +243,7 @@ void MEMORY_CONTROLLER::begin_phase()
 
 void MEMORY_CONTROLLER::end_phase(unsigned)
 {
+
   for (auto& chan : channels) {
     chan.roi_stats = chan.sim_stats;
   }
@@ -298,39 +330,65 @@ DRAM_CHANNEL::request_type::request_type(typename champsim::channel::request_typ
 
 bool MEMORY_CONTROLLER::add_rq(const request_type& packet, champsim::channel* ul)
 {
-  auto& channel = channels[dram_get_channel(packet.address)];
+  if (!isMessActive) {
+    // Default ChampSim behave
+    auto& channel = channels[dram_get_channel(packet.address)];
 
-  // Find empty slot
-  if (auto rq_it = std::find_if_not(std::begin(channel.RQ), std::end(channel.RQ), [](const auto& pkt) { return pkt.has_value(); });
-      rq_it != std::end(channel.RQ)) {
-    *rq_it = DRAM_CHANNEL::request_type{packet};
-    rq_it->value().forward_checked = false;
-    rq_it->value().event_cycle = current_cycle;
-    if (packet.response_requested)
-      rq_it->value().to_return = {&ul->returned};
+    // Find empty slot
+    if (auto rq_it = std::find_if_not(std::begin(channel.RQ), std::end(channel.RQ), [](const auto& pkt) { return pkt.has_value(); });
+        rq_it != std::end(channel.RQ)) {
+      *rq_it = DRAM_CHANNEL::request_type{packet};
+      rq_it->value().forward_checked = false;
+      rq_it->value().event_cycle = current_cycle;
+      if (packet.response_requested)
+        rq_it->value().to_return = {&ul->returned};
 
-    return true;
+      return true;
+    }
+
+    return false;
   }
 
-  return false;
+  if (warmup) {
+    response_type response{packet.address, packet.v_address, packet.data, packet.pf_metadata, packet.instr_depend_on_me};
+
+    // std::cout << current_cycle << " " << pkt.event_cycle << std::endl;
+    for (auto* ret : {&ul->returned}) {
+      ret->push_back(response);
+    }
+    return true;
+  }
+  uint64_t cycle = mess.access(current_cycle, false);
+  response_type response{packet.address, packet.v_address, packet.data, packet.pf_metadata, packet.instr_depend_on_me};
+  MesstoReturn.insert(MessEntry(current_cycle + cycle, response, ul));
+  return true;
 }
 
 bool MEMORY_CONTROLLER::add_wq(const request_type& packet)
 {
-  auto& channel = channels[dram_get_channel(packet.address)];
+  if (!isMessActive) {
+    auto& channel = channels[dram_get_channel(packet.address)];
 
-  // search for the empty index
-  if (auto wq_it = std::find_if_not(std::begin(channel.WQ), std::end(channel.WQ), [](const auto& pkt) { return pkt.has_value(); });
-      wq_it != std::end(channel.WQ)) {
-    *wq_it = DRAM_CHANNEL::request_type{packet};
-    wq_it->value().forward_checked = false;
-    wq_it->value().event_cycle = current_cycle;
+    // search for the empty index
+    if (auto wq_it = std::find_if_not(std::begin(channel.WQ), std::end(channel.WQ), [](const auto& pkt) { return pkt.has_value(); });
+        wq_it != std::end(channel.WQ)) {
+      *wq_it = DRAM_CHANNEL::request_type{packet};
+      wq_it->value().forward_checked = false;
+      wq_it->value().event_cycle = current_cycle;
 
-    return true;
+      return true;
+    }
+
+    ++channel.sim_stats.WQ_FULL;
+    return false;
   }
 
-  ++channel.sim_stats.WQ_FULL;
-  return false;
+  if (warmup) {
+    return true;
+  }
+  mess.access(current_cycle, true);
+
+  return true;
 }
 
 /*

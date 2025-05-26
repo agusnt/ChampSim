@@ -21,10 +21,12 @@
 #include <cmath>
 #include <limits>
 #include <optional>
+#include <set>
 #include <string>
 
 #include "champsim_constants.h"
 #include "channel.h"
+#include "mess.hh"
 #include "operable.h"
 
 struct dram_stats {
@@ -101,10 +103,30 @@ class MEMORY_CONTROLLER : public champsim::operable
   bool add_rq(const request_type& pkt, champsim::channel* ul);
   bool add_wq(const request_type& pkt);
 
+  class MessEntry
+  {
+  public:
+    uint64_t ready_cycle = 0;
+    response_type response;
+    channel_type* ul;
+    MessEntry(uint64_t ready_cycle, response_type response, channel_type* ul) : ready_cycle(ready_cycle), response(response), ul(ul) {}
+    MessEntry(uint64_t ready_cycle) : ready_cycle(ready_cycle) {}
+    bool operator<(const MessEntry& b) const { return ready_cycle < b.ready_cycle; }
+    bool operator<(const uint64_t b) const { return ready_cycle < b; }
+  };
+  struct messCompare {
+    bool operator()(MessEntry a, uint64_t b) const { return a.ready_cycle < b; }
+  };
+
+  bool isMessActive;
+  MessMemCtrl mess;
+  std::multiset<MessEntry> MesstoReturn;
+
 public:
   std::array<DRAM_CHANNEL, DRAM_CHANNELS> channels;
 
-  MEMORY_CONTROLLER(double freq_scale, int io_freq, double t_rp, double t_rcd, double t_cas, double turnaround, std::vector<channel_type*>&& ul);
+  MEMORY_CONTROLLER(double freq_scale, int io_freq, double t_rp, double t_rcd, double t_cas, double turnaround, std::vector<channel_type*>&& ul,
+                    std::string mess_curve, double cpu_freq);
 
   void initialize() override final;
   long operate() override final;

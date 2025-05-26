@@ -93,6 +93,7 @@ class channel
         : address(addr), v_address(v_addr), data(data_), pf_metadata(pf_meta), instr_depend_on_me(deps)
     {
     }
+    response() = default;
     explicit response(request req) : response(req.address, req.v_address, req.data, req.pf_metadata, req.instr_depend_on_me) {}
   };
 
