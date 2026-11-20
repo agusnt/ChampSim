@@ -17,3 +17,16 @@ vcpkg_installed/
 
 **/_build
 **/_doxygen
+
+absolute.options
+**/legacy.options
+**/function_patch.options
+**/legacy_bridge.inc
+**/legacy_bridge.h
+**/legacy_bridge.cc
+
+.cache/
+compile_commands.json
+
+.vscode/
+**/.DS_Store

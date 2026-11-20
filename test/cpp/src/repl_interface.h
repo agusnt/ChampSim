@@ -5,17 +5,26 @@
 
 namespace test
 {
-  struct repl_update_interface
-  {
-    uint32_t cpu;
-    uint32_t set;
-    uint32_t way;
-    uint64_t full_addr;
-    uint64_t ip;
-    uint64_t victim_addr;
-    access_type type;
-    uint8_t hit;
-  };
-}
+struct repl_update_interface {
+  uint32_t cpu;
+  long set;
+  long way;
+  champsim::address full_addr;
+  champsim::address ip;
+  champsim::address victim_addr;
+  access_type type;
+  bool hit;
+};
+
+struct repl_fill_interface {
+  uint32_t cpu;
+  long set;
+  long way;
+  champsim::address full_addr;
+  champsim::address ip;
+  champsim::address victim_addr;
+  access_type type;
+};
+} // namespace test
 
 #endif
